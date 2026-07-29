@@ -82,10 +82,6 @@ def compute_dsv4_index_topk_flags(
     index_topk_freq: int = 1,
     index_topk_pattern: Optional[Union[str, List[str]]] = None,
 ) -> Tuple[bool, bool]:
-    # A JSON override may set index_topk_freq to null (None); treat an unset
-    # frequency as the default 1. A genuine illegal value (0, negative) still
-    # falls through to the positivity check below rather than being silently
-    # coerced.
     if index_topk_freq is None:
         index_topk_freq = 1
     c4_layer_ids = get_dsv4_c4_layer_ids(compress_ratios)
@@ -209,12 +205,6 @@ def compute_dsv4_index_cache_descriptor(
     import hashlib
     import json
 
-    # Called only for a DeepSeekV4TokenToKVPool. hf_config is a runtime
-    # _DeepseekV4ConfigAlias (transformers DeepseekV3Config subclass), NOT the
-    # DeepSeekV4Config dataclass, so index_topk_freq / index_topk_pattern may
-    # be absent when not set in config.json / json_model_override_args. Access
-    # defensively; index_topk_freq None-normalization / validation lives in
-    # compute_dsv4_index_topk_flags (reached via producer_layer_ids below).
     compress_ratios = list(getattr(hf_config, "compress_ratios", None) or [])
     index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
     index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)

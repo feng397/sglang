@@ -676,9 +676,6 @@ class MQALayer(MqaAttentionBase):
                     alt_streams=self.alt_streams_indexer,
                     rotary_emb=getattr(self, "rotary_emb", None),
                 )
-                # config is the runtime _DeepseekV4ConfigAlias (a transformers
-                # config), not the DeepSeekV4Config dataclass, so these optional
-                # index-cache fields may be absent -- read defensively.
                 self.index_topk_freq = getattr(config, "index_topk_freq", 1)
                 self.index_topk_pattern = getattr(config, "index_topk_pattern", None)
                 self.skip_topk, self.next_skip_topk = compute_dsv4_index_topk_flags(

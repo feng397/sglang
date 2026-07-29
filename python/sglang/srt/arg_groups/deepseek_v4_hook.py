@@ -166,13 +166,6 @@ def validate_deepseek_v4_index_cache(server_args: ServerArgs, hf_config) -> None
     """
     from sglang.srt.models.deepseek_common.utils import dsv4_index_cache_enabled
 
-    # hf_config is a _DeepseekV4ConfigAlias (a transformers DeepseekV3Config
-    # subclass), NOT the DeepSeekV4Config dataclass -- its dataclass defaults do
-    # not apply at runtime. The alias only carries keys present in config.json
-    # or applied via --json-model-override-args, so index_topk_freq /
-    # index_topk_pattern may be absent. Access defensively (mirrors the DSA
-    # path in model_config.py). Normalization of None freq / validation of an
-    # illegal freq lives in compute_dsv4_index_topk_flags.
     compress_ratios = getattr(hf_config, "compress_ratios", None)
     if not compress_ratios:
         return

@@ -849,15 +849,8 @@ class C4IndexerBackendMixin:
         compress_layer_id = token_to_kv_pool.layer_mapping[
             c4_indexer.layer_id
         ].compress_layer_id
-        # JD deviation from upstream PR #26274: when the current forward has a
-        # metadata raw scratch (ordinary EXTEND sparse-prefill allocates it),
-        # it is the canonical raw buffer consumed per-layer by sparse-prefill
-        # C4 attention. Explicitly sync prev_topk_indices into it before the
-        # raw->page translation so the shared layer's sparse-prefill consumer
-        # reads this layer's raw indices, not a stale producer scratch. All C4
-        # layers in a forward share the query count, so prev and the current
-        # layer's tensors normally align; match defensively so a producer that
-        # padded/truncated its query rows cannot desync the copy or the kernel.
+        # Sparse prefill consumes the per-layer raw scratch, so synchronize it
+        # with the reused top-k before translating to page indices.
         num_rows = c4_sparse_page_indices.shape[0]
         raw_indices = self._match_num_queries(prev_topk_indices, num_rows, value=-1)
         if core_metadata.c4_sparse_raw_indices is not None:
@@ -1091,14 +1084,7 @@ class C4IndexerBackendMixin:
         if self.debug_use_external_c4_sparse_indices:
             return None
 
-        # JD deviation from upstream PR #26274 (design §2.2 / §6.2): the
-        # metadata raw scratch, when present, is the canonical raw buffer for
-        # this forward -- ordinary EXTEND sparse-prefill C4 attention reads it
-        # per-layer. It MUST take priority so capture / cross-layer reuse
-        # (return_topk_indices) share the same tensor rather than a separate
-        # one that would leave the sparse-prefill scratch stale. Only when it
-        # is absent (decode / target-verify) do we allocate a dedicated stable
-        # buffer for capture / cross-layer reuse.
+        # Sparse prefill's metadata scratch is the canonical raw buffer.
         raw_indices = None
         if core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = self._match_num_queries(
