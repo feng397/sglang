@@ -473,12 +473,6 @@ class CommonKVManager(BaseKVManager):
 
         info: PrefillServerInfo = None
         try:
-            # `dsv4_indexcache_desc=1` advertises that this (new-image) decode
-            # can parse the DSV4 IndexCache descriptor fields. The bootstrap
-            # only includes them in the response when this capability param is
-            # present, so an old-image decode (which omits it) gets the exact
-            # old response shape and its strict PrefillServerInfo(**data) parse
-            # does not hit TypeError on unknown keys.
             url = (
                 f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}"
                 f"&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
@@ -515,10 +509,6 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
-        # DeepSeek V4 IndexCache: layout must match and the decode engine's
-        # required producer set must be a subset of the prefill engine's.
-        # Both KVArgs construction paths (prefill/decode _init_kv_manager)
-        # always set these fields, so access them directly.
         decode_sig = self.kv_args.dsv4_index_cache_layout_signature
         if (
             info.dsv4_index_cache_layout_signature is not None
@@ -1531,10 +1521,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
-        # DeepSeek V4 IndexCache descriptor, first-write-wins then verified
-        # equal across all registering prefill ranks. _dsv4_descriptor_seen
-        # records whether ANY rank has reported one, so a later rank that omits
-        # it (version skew / bug) is rejected rather than silently accepted.
         self.dsv4_index_cache_layout_signature: Optional[str] = None
         self.dsv4_index_cache_producer_layer_ids: Optional[List[int]] = None
         self._dsv4_descriptor_seen: bool = False
@@ -1631,11 +1617,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
 
-        # DeepSeek V4 IndexCache descriptor: first-write-wins, then every
-        # subsequent prefill rank must report the identical layout + producer
-        # mask. Enforce all-or-none too: once any rank reports a descriptor, a
-        # rank omitting it (or vice versa) is a version-skew / bug and is
-        # rejected so the fleet cannot become ready with an inconsistent P set.
         if self._dsv4_descriptor_seen and dsv4_sig is None:
             return web.Response(
                 text=(
@@ -1721,8 +1702,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         prefill_cp_rank = request.query.get("prefill_cp_rank")
         target_tp_rank = request.query.get("target_tp_rank")
         target_pp_rank = request.query.get("target_pp_rank")
-        # Capability flag: only a new-image decode sends this, so only it
-        # receives the DSV4 IndexCache descriptor fields in the response.
         wants_dsv4_descriptor = request.query.get("dsv4_indexcache_desc") == "1"
         if (
             not prefill_dp_rank
@@ -1766,13 +1745,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
             )
             payload = dataclasses.asdict(info)
-            # Only a decode that advertised the capability param can parse the
-            # DSV4 IndexCache descriptor keys. Strip them for any other caller
-            # (old-image decode -> strict PrefillServerInfo(**data) would raise
-            # TypeError on unknown keys). This is capability-based, NOT gated on
-            # freq: a V4 prefill at freq=1 still produces a real layout
-            # signature, and the P freq=1 + D freq=4 gray-upgrade needs it, so a
-            # new decode always receives it.
             if not wants_dsv4_descriptor:
                 payload.pop("dsv4_index_cache_layout_signature", None)
                 payload.pop("dsv4_index_cache_producer_layer_ids", None)

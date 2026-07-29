@@ -476,9 +476,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
 
-        # DeepSeek V4 IndexCache PD compatibility descriptor. Computed on the
-        # decode side too so try_ensure_parallel_info can verify layout equality
-        # and D-producers-subset-of-P against the fetched prefill descriptor.
         kv_args.dsv4_index_cache_layout_signature = None
         kv_args.dsv4_index_cache_producer_layer_ids = None
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):

@@ -149,12 +149,7 @@ def compute_dsv4_index_topk_flags_for_all_c4_layers(
     index_topk_freq: int = 1,
     index_topk_pattern: Optional[Union[str, List[str]]] = None,
 ) -> "dict[int, Tuple[bool, bool]]":
-    """Map each C4 layer id -> (skip_topk, next_skip_topk).
-
-    Normalizes freq/pattern once so callers judge IndexCache activation from
-    effective per-C4-layer flags, not by scanning raw pattern characters at
-    non-C4 positions.
-    """
+    """Map each C4 layer id -> (skip_topk, next_skip_topk)."""
     return {
         layer_id: compute_dsv4_index_topk_flags(
             compress_ratios, layer_id, index_topk_freq, index_topk_pattern
@@ -168,7 +163,6 @@ def dsv4_index_cache_enabled(
     index_topk_freq: int = 1,
     index_topk_pattern: Optional[Union[str, List[str]]] = None,
 ) -> bool:
-    """True when any C4 layer effectively reuses a previous producer's raw top-k."""
     flags = compute_dsv4_index_topk_flags_for_all_c4_layers(
         compress_ratios, index_topk_freq, index_topk_pattern
     )
@@ -180,11 +174,6 @@ def dsv4_index_cache_producer_layer_ids(
     index_topk_freq: int = 1,
     index_topk_pattern: Optional[Union[str, List[str]]] = None,
 ) -> List[int]:
-    """C4 layers that run the full indexer and generate indexer K/state (F layers).
-
-    A C4 layer is a producer unless it is itself a shared (skip_topk) layer.
-    These are exactly the layers whose indexer cache a decode engine may need.
-    """
     flags = compute_dsv4_index_topk_flags_for_all_c4_layers(
         compress_ratios, index_topk_freq, index_topk_pattern
     )
@@ -199,15 +188,6 @@ def compute_dsv4_index_cache_descriptor(
     fp4_indexer_enabled: bool,
     page_size: int,
 ) -> "Tuple[str, List[int]]":
-    """Build the (layout_signature, producer_layer_ids) PD compatibility pair.
-
-    layout_signature is a stable sha256 over the runtime index-cache layout;
-    producer_layer_ids lists the C4 producer layers this engine provides. Two
-    engines are layout-compatible iff their signatures match; a decode engine
-    is safe iff its required producer set is a subset of the prefill set.
-    Built from the actually-loaded hf_config + effective ServerArgs, never from
-    served-model-name or model path.
-    """
     import hashlib
     import json
 
@@ -241,11 +221,6 @@ def validate_dsv4_index_cache_pd_compatibility(
     decode_layout_signature: str,
     decode_producer_layer_ids: List[int],
 ) -> None:
-    """Raise if a decode engine cannot safely consume a prefill engine's cache.
-
-    Layout signatures must match exactly, and the decode engine's required
-    producer set must be a subset of the prefill engine's provided set.
-    """
     if prefill_layout_signature != decode_layout_signature:
         raise RuntimeError(
             "DSV4 IndexCache layout mismatch between prefill and decode: "

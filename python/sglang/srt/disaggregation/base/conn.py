@@ -79,11 +79,6 @@ class KVArgs:
     # the connection layer to slice the buffer-type-organized flat list in a
     # PP-aware manner.
     mla_compression_ratios: Optional[List[int]]
-    # DeepSeek V4 IndexCache PD compatibility descriptor. Purely a config
-    # compatibility check exchanged at bootstrap; does NOT change KV/indexer
-    # pointer layout or transfer payload. layout_signature is a stable hash of
-    # the runtime layout; index_cache_producer_layer_ids lists the C4 layers
-    # this engine generates indexer K/state for (F/producer layers).
     dsv4_index_cache_layout_signature: Optional[str]
     dsv4_index_cache_producer_layer_ids: Optional[List[int]]
     # Only used of npu, for kv buf groups

@@ -860,7 +860,6 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
-        # Read the indexer's raw top-k only after waiting on stream_indexer.
         return q, topk_indices
 
     def _forward_prepare_multi_stream_hip(
@@ -890,11 +889,6 @@ class MQALayer(MqaAttentionBase):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        # A shared (skip_topk) layer reuses the previous producer's raw top-k
-        # and never runs its own indexer, so skip the indexer compressor too
-        # (matches the CUDA path, where forward_c4_indexer's skip branch never
-        # touches the indexer compressor). The main C4 self.compressor above
-        # still runs unconditionally.
         if (
             self.indexer is not None
             and not self.skip_topk
@@ -1197,8 +1191,6 @@ class MQALayer(MqaAttentionBase):
         topk_state: Optional[Dsv4IndexTopkState] = None,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            # Empty batch: clear carried raw top-k so the next layer does not
-            # reuse a stale producer result.
             if topk_state is not None and self.next_skip_topk is not None:
                 topk_state.prev = None
             return x
@@ -1378,8 +1370,6 @@ class MQALayer(MqaAttentionBase):
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
-        # Carry this layer's raw top-k to the next C4 layer only when it is a
-        # producer for a following shared layer; otherwise clear it.
         if topk_state is not None and self.next_skip_topk is not None:
             topk_state.prev = topk_indices if self.next_skip_topk else None
         return o
@@ -2210,9 +2200,6 @@ class DeepseekV4Model(nn.Module):
             for layer_id in c4_layers
             if self.layers[layer_id].self_attn.skip_topk
         ]
-        # Only log "enabled" when some C4 layer actually reuses a prior
-        # producer's raw top-k. A freq=1 default, or an all-'F' pattern, yields
-        # no shared layers and must not be reported as IndexCache-on.
         if skip_layers:
             producer_layers = [
                 layer_id
@@ -2462,9 +2449,6 @@ class DeepseekV4Model(nn.Module):
             use_fused = self.use_fused_mhc_post_pre
             prev_residual, prev_post, prev_comb = None, None, None
             last_layer = None
-            # One IndexCache raw-topk carrier per model forward. Non-C4 layers
-            # leave it untouched (their MQALayer.indexer is None), so it survives
-            # across C128/dense layers between C4 producer/shared pairs.
             topk_state = Dsv4IndexTopkState()
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]

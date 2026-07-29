@@ -156,14 +156,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
 
 
 def validate_deepseek_v4_index_cache(server_args: ServerArgs, hf_config) -> None:
-    """Fail-fast on unsupported DeepSeek V4 IndexCache combinations.
-
-    IndexCache activation is judged from the effective per-C4-layer flags, not
-    by scanning raw pattern characters (non-C4 positions must not enable it).
-    First version rejects IndexCache + TBO and IndexCache + PP>1: the TBO op
-    path does not carry raw top-k across layer ops, and PP>1 would require
-    passing large raw top-k across pipeline stages. Both are deferred.
-    """
+    """Fail-fast on unsupported DeepSeek V4 IndexCache combinations."""
     from sglang.srt.models.deepseek_common.utils import dsv4_index_cache_enabled
 
     compress_ratios = getattr(hf_config, "compress_ratios", None)
