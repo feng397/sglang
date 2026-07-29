@@ -77,7 +77,9 @@ class TestDeepseekV4IndexCacheUtils(CustomTestCase):
         )
 
     def test_invalid_index_topk_freq(self):
-        with self.assertRaisesRegex(ValueError, "index_topk_freq must be positive"):
+        with self.assertRaisesRegex(
+            ValueError, "index_topk_freq must be a positive integer"
+        ):
             compute_dsv4_index_topk_flags(self.COMPRESS_RATIOS, 2, 0)
 
     def test_none_index_topk_freq_defaults_to_one(self):
@@ -93,8 +95,20 @@ class TestDeepseekV4IndexCacheUtils(CustomTestCase):
         )
 
     def test_negative_index_topk_freq_rejected(self):
-        with self.assertRaisesRegex(ValueError, "index_topk_freq must be positive"):
+        with self.assertRaisesRegex(
+            ValueError, "index_topk_freq must be a positive integer"
+        ):
             compute_dsv4_index_topk_flags(self.COMPRESS_RATIOS, 2, -2)
+
+    def test_non_integer_index_topk_freq_rejected(self):
+        for index_topk_freq in (2.5, True):
+            with self.subTest(index_topk_freq=index_topk_freq):
+                with self.assertRaisesRegex(
+                    ValueError, "index_topk_freq must be a positive integer"
+                ):
+                    compute_dsv4_index_topk_flags(
+                        self.COMPRESS_RATIOS, 2, index_topk_freq
+                    )
 
     def test_invalid_index_topk_pattern_value(self):
         with self.assertRaisesRegex(ValueError, "only supports 'F'.*'S'"):

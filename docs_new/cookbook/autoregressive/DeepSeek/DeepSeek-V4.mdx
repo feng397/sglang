@@ -254,7 +254,7 @@ sglang serve \
 
 **IndexCache**
 
-IndexCache reuses C4 indexer topk results across layers. This can improve long-context serving throughput with a small accuracy tradeoff. To try it from the [Playground above](#playground), open the **IndexCache** card and select `index_topk_freq=4`. The equivalent command-line override is:
+IndexCache reuses C4 indexer topk results across layers. This can improve long-context serving throughput with a small accuracy tradeoff. Enable it with a JSON model override:
 
 ```bash Command
 sglang serve \

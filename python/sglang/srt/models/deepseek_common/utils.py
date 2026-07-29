@@ -84,12 +84,18 @@ def compute_dsv4_index_topk_flags(
 ) -> Tuple[bool, bool]:
     if index_topk_freq is None:
         index_topk_freq = 1
+    if (
+        isinstance(index_topk_freq, bool)
+        or not isinstance(index_topk_freq, int)
+        or index_topk_freq <= 0
+    ):
+        raise ValueError(
+            f"index_topk_freq must be a positive integer, got {index_topk_freq}"
+        )
     c4_layer_ids = get_dsv4_c4_layer_ids(compress_ratios)
     c4_layer_rank = c4_layer_ids.index(layer_id)
 
     if index_topk_pattern is None:
-        if index_topk_freq <= 0:
-            raise ValueError(f"index_topk_freq must be positive, got {index_topk_freq}")
         skip_topk = c4_layer_rank % index_topk_freq != 0
         next_skip_topk = (
             c4_layer_rank + 1 < len(c4_layer_ids)
