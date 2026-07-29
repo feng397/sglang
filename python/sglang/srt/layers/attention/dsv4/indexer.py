@@ -42,7 +42,10 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
@@ -784,6 +787,105 @@ class C4IndexerBackendMixin:
             max_seqlen_k=plan.max_seqlen_k,
         )
 
+    @staticmethod
+    def _match_num_queries(
+        tensor: torch.Tensor, num_queries: int, value: int
+    ) -> torch.Tensor:
+        if tensor.shape[0] == num_queries:
+            return tensor
+        if tensor.shape[0] > num_queries:
+            return tensor[:num_queries]
+        pad = (0, 0) * (tensor.dim() - 1) + (0, num_queries - tensor.shape[0])
+        return F.pad(tensor, pad, value=value)
+
+    def _update_hisparse_c4_sparse_indices(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: "DeepSeekV4TokenToKVPool",
+        indexer_metadata: PagedIndexerMetadata,
+        core_metadata,
+        hisparse_coordinator,
+        hisparse_decode: bool,
+        raw_indices: Optional[torch.Tensor],
+        compress_layer_id: int,
+    ) -> None:
+        if hisparse_coordinator is None:
+            return
+
+        if hisparse_decode:
+            core_metadata.c4_sparse_page_indices = (
+                hisparse_coordinator.swap_in_selected_pages(
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    compressed_seq_lens=indexer_metadata.c4_seq_lens,
+                    top_k_result=raw_indices,
+                    layer_id=compress_layer_id,
+                )
+            )
+        else:
+            # flash_mla C4 attention requires int32 page indices.
+            core_metadata.c4_sparse_page_indices = (
+                token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                    core_metadata.c4_sparse_page_indices
+                ).to(torch.int32)
+            )
+
+    def _forward_c4_indexer_skip_topk(
+        self,
+        *,
+        c4_indexer: "C4Indexer",
+        forward_batch: ForwardBatch,
+        token_to_kv_pool: "DeepSeekV4TokenToKVPool",
+        indexer_metadata: PagedIndexerMetadata,
+        core_metadata,
+        c4_seq_lens: torch.Tensor,
+        page_table: torch.Tensor,
+        c4_sparse_page_indices: torch.Tensor,
+        prev_topk_indices: torch.Tensor,
+        return_topk_indices: bool,
+        hisparse_coordinator,
+        hisparse_decode: bool,
+    ) -> Optional[torch.Tensor]:
+        compress_layer_id = token_to_kv_pool.layer_mapping[
+            c4_indexer.layer_id
+        ].compress_layer_id
+        # JD deviation from upstream PR #26274: when the current forward has a
+        # metadata raw scratch (ordinary EXTEND sparse-prefill allocates it),
+        # it is the canonical raw buffer consumed per-layer by sparse-prefill
+        # C4 attention. Explicitly sync prev_topk_indices into it before the
+        # raw->page translation so the shared layer's sparse-prefill consumer
+        # reads this layer's raw indices, not a stale producer scratch. All C4
+        # layers in a forward share the query count, so prev and the current
+        # layer's tensors normally align; match defensively so a producer that
+        # padded/truncated its query rows cannot desync the copy or the kernel.
+        num_rows = c4_sparse_page_indices.shape[0]
+        raw_indices = self._match_num_queries(prev_topk_indices, num_rows, value=-1)
+        if core_metadata.c4_sparse_raw_indices is not None:
+            scratch = self._match_num_queries(
+                core_metadata.c4_sparse_raw_indices, num_rows, value=-1
+            )
+            scratch.copy_(raw_indices)
+            raw_indices = scratch
+        raw_indices = maybe_capture_indexer_topk(compress_layer_id, raw_indices)
+        transform_raw_c4_indices_to_page_indices(
+            raw_indices,
+            c4_seq_lens,
+            page_table,
+            c4_sparse_page_indices,
+            indexer_metadata.c4_page_size,
+        )
+        self._update_hisparse_c4_sparse_indices(
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            indexer_metadata=indexer_metadata,
+            core_metadata=core_metadata,
+            hisparse_coordinator=hisparse_coordinator,
+            hisparse_decode=hisparse_decode,
+            raw_indices=raw_indices,
+            compress_layer_id=compress_layer_id,
+        )
+        return raw_indices if return_topk_indices else None
+
     def forward_c4_indexer(
         self,
         x: torch.Tensor,
@@ -793,10 +895,17 @@ class C4IndexerBackendMixin:
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+        skip_topk: bool = False,
+        return_topk_indices: bool = False,
         skip_compressor: bool = False,
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         if forward_batch.forward_mode.is_idle():
-            return
+            return None
+
+        # PREP_IN_CG lazy upgrade: this runs from MQALayer._forward_prepare,
+        # before attn_backend.forward() would trigger the upgrade.
+        self.init_forward_metadata_in_graph(forward_batch)
         token_to_kv_pool = self.token_to_kv_pool
 
         if TYPE_CHECKING:
@@ -817,6 +926,50 @@ class C4IndexerBackendMixin:
             q_lora = q_lora[:num_queries]
         if positions.shape[0] != num_queries:
             positions = positions[:num_queries]
+
+        c4_seq_lens = self._match_num_queries(
+            indexer_metadata.c4_seq_lens, num_queries, value=1
+        )
+        page_table = self._match_num_queries(
+            indexer_metadata.page_table, num_queries, value=0
+        )
+        c4_sparse_page_indices = self._match_num_queries(
+            core_metadata.c4_sparse_page_indices, num_queries, value=-1
+        )
+
+        indexer_capturer = get_global_indexer_capturer()
+        capture_enabled = indexer_capturer is not None
+
+        hisparse_coordinator = self.hisparse_coordinator
+        hisparse_decode = (
+            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
+        )
+
+        if skip_topk and prev_topk_indices is not None:
+            return self._forward_c4_indexer_skip_topk(
+                c4_indexer=c4_indexer,
+                forward_batch=forward_batch,
+                token_to_kv_pool=token_to_kv_pool,
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+                c4_seq_lens=c4_seq_lens,
+                page_table=page_table,
+                c4_sparse_page_indices=c4_sparse_page_indices,
+                prev_topk_indices=prev_topk_indices,
+                return_topk_indices=return_topk_indices,
+                hisparse_coordinator=hisparse_coordinator,
+                hisparse_decode=hisparse_decode,
+            )
+
+        if skip_topk and prev_topk_indices is None:
+            raise RuntimeError(
+                "DeepSeek V4 IndexCache shared layer "
+                f"{c4_indexer.layer_id} requested skip_topk but no producer "
+                "raw top-k is available. Refusing to silently fall back to a "
+                "full indexer, which could read stale/uninitialized indexer "
+                "state (the producer layer may not have generated indexer K "
+                "for this shared layer)."
+            )
 
         if enable_multi_stream:
             q_indexer, weights = self._forward_prepare_multi_stream(
@@ -879,20 +1032,18 @@ class C4IndexerBackendMixin:
 
         query_rows = q_indexer[0].shape[0] if use_fp4_indexer else q_indexer.shape[0]
 
-        def match_num_queries(tensor: torch.Tensor, value: int) -> torch.Tensor:
-            if tensor.shape[0] == query_rows:
-                return tensor
-            if tensor.shape[0] > query_rows:
-                return tensor[:query_rows]
-            pad = (0, 0) * (tensor.dim() - 1) + (0, query_rows - tensor.shape[0])
-            return F.pad(tensor, pad, value=value)
-
-        c4_seq_lens = match_num_queries(indexer_metadata.c4_seq_lens, value=1)
+        if query_rows != num_queries:
+            num_queries = query_rows
+            c4_seq_lens = self._match_num_queries(
+                indexer_metadata.c4_seq_lens, num_queries, value=1
+            )
+            page_table = self._match_num_queries(
+                indexer_metadata.page_table, num_queries, value=0
+            )
+            c4_sparse_page_indices = self._match_num_queries(
+                core_metadata.c4_sparse_page_indices, num_queries, value=-1
+            )
         _c4sl = c4_seq_lens
-        page_table = match_num_queries(indexer_metadata.page_table, value=0)
-        c4_sparse_page_indices = match_num_queries(
-            core_metadata.c4_sparse_page_indices, value=-1
-        )
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
         )
@@ -938,25 +1089,27 @@ class C4IndexerBackendMixin:
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
-            return
+            return None
 
-        indexer_capturer = get_global_indexer_capturer()
-        capture_enabled = indexer_capturer is not None
-
-        hisparse_coordinator = self.hisparse_coordinator
-        hisparse_decode = (
-            hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
-        )
-
+        # JD deviation from upstream PR #26274 (design §2.2 / §6.2): the
+        # metadata raw scratch, when present, is the canonical raw buffer for
+        # this forward -- ordinary EXTEND sparse-prefill C4 attention reads it
+        # per-layer. It MUST take priority so capture / cross-layer reuse
+        # (return_topk_indices) share the same tensor rather than a separate
+        # one that would leave the sparse-prefill scratch stale. Only when it
+        # is absent (decode / target-verify) do we allocate a dedicated stable
+        # buffer for capture / cross-layer reuse.
         raw_indices = None
-        if capture_enabled:
-            raw_indices = torch.empty_like(c4_sparse_page_indices)
+        if core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = self._match_num_queries(
+                core_metadata.c4_sparse_raw_indices, num_queries, value=-1
+            )
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
+        elif return_topk_indices or capture_enabled:
+            raw_indices = torch.empty_like(c4_sparse_page_indices)
 
         if (
             envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
@@ -998,31 +1151,27 @@ class C4IndexerBackendMixin:
                 raw_indices,
             )
         if hisparse_coordinator is not None:
-            if hisparse_decode:
-                compress_layer_id = token_to_kv_pool.layer_mapping[
-                    c4_indexer.layer_id
-                ].compress_layer_id
-                core_metadata.c4_sparse_page_indices = (
-                    hisparse_coordinator.swap_in_selected_pages(
-                        req_pool_indices=forward_batch.req_pool_indices,
-                        compressed_seq_lens=indexer_metadata.c4_seq_lens,
-                        top_k_result=raw_indices,
-                        layer_id=compress_layer_id,
-                    )
-                )
-            else:
-                # flash_mla C4 attention requires int32 page indices.
-                core_metadata.c4_sparse_page_indices = (
-                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
-                        core_metadata.c4_sparse_page_indices
-                    ).to(torch.int32)
-                )
+            compress_layer_id = token_to_kv_pool.layer_mapping[
+                c4_indexer.layer_id
+            ].compress_layer_id
+            self._update_hisparse_c4_sparse_indices(
+                forward_batch=forward_batch,
+                token_to_kv_pool=token_to_kv_pool,
+                indexer_metadata=indexer_metadata,
+                core_metadata=core_metadata,
+                hisparse_coordinator=hisparse_coordinator,
+                hisparse_decode=hisparse_decode,
+                raw_indices=raw_indices,
+                compress_layer_id=compress_layer_id,
+            )
 
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[
                 c4_indexer.layer_id
             ].compress_layer_id
             indexer_capturer.capture(compress_layer_id, raw_indices)
+
+        return raw_indices if return_topk_indices else None
 
 
 class C4Indexer(nn.Module):
@@ -1111,8 +1260,11 @@ class C4Indexer(nn.Module):
         attn_backend: AttentionBackend,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+        skip_topk: bool = False,
+        return_topk_indices: bool = False,
         skip_compressor: bool = False,
-    ) -> None:
+    ) -> Optional[torch.Tensor]:
         return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
@@ -1121,5 +1273,8 @@ class C4Indexer(nn.Module):
             alt_streams=self.alt_streams,
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
+            prev_topk_indices=prev_topk_indices,
+            skip_topk=skip_topk,
+            return_topk_indices=return_topk_indices,
             skip_compressor=skip_compressor,
         )
