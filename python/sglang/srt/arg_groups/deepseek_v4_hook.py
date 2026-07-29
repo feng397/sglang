@@ -155,6 +155,52 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
 
 
+def validate_deepseek_v4_index_cache(server_args: ServerArgs, hf_config) -> None:
+    """Fail-fast on unsupported DeepSeek V4 IndexCache combinations.
+
+    IndexCache activation is judged from the effective per-C4-layer flags, not
+    by scanning raw pattern characters (non-C4 positions must not enable it).
+    First version rejects IndexCache + TBO and IndexCache + PP>1: the TBO op
+    path does not carry raw top-k across layer ops, and PP>1 would require
+    passing large raw top-k across pipeline stages. Both are deferred.
+    """
+    from sglang.srt.models.deepseek_common.utils import dsv4_index_cache_enabled
+
+    # hf_config is a _DeepseekV4ConfigAlias (a transformers DeepseekV3Config
+    # subclass), NOT the DeepSeekV4Config dataclass -- its dataclass defaults do
+    # not apply at runtime. The alias only carries keys present in config.json
+    # or applied via --json-model-override-args, so index_topk_freq /
+    # index_topk_pattern may be absent. Access defensively (mirrors the DSA
+    # path in model_config.py). Normalization of None freq / validation of an
+    # illegal freq lives in compute_dsv4_index_topk_flags.
+    compress_ratios = getattr(hf_config, "compress_ratios", None)
+    if not compress_ratios:
+        return
+    index_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+    index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
+
+    if not dsv4_index_cache_enabled(
+        compress_ratios, index_topk_freq, index_topk_pattern
+    ):
+        return
+
+    if server_args.enable_two_batch_overlap:
+        raise ValueError(
+            "--enable-two-batch-overlap is not supported with DeepSeek V4 "
+            "IndexCache (index_topk_freq > 1 or an index_topk_pattern with "
+            "shared layers): the TBO op path does not propagate raw top-k "
+            "across layer ops, so shared layers would run sparse attention "
+            "without indices. Disable one of them."
+        )
+
+    if server_args.pp_size > 1:
+        raise ValueError(
+            "Pipeline parallelism (pp_size > 1) is not supported with "
+            "DeepSeek V4 IndexCache: raw top-k is not passed across pipeline "
+            "stages. Disable one of them."
+        )
+
+
 def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
     if not server_args.enable_prefill_cp:
