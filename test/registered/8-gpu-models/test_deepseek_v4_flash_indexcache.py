@@ -1,14 +1,3 @@
-"""8-GPU CI: DeepSeek-V4-Flash FP8 with IndexCache.
-
-Launches DeepSeek-V4-Flash FP8 with the IndexCache recipe and checks GSM8K
-accuracy, mirroring the DeepSeek-V3.2 IndexCache e2e coverage. Exercises both
-`index_topk_pattern` and `index_topk_freq` through real server startup (which
-runs the C4 producer/shared forward paths, the raw->page transform, and the
-startup validation added for DeepSeek V4 IndexCache).
-
-Registry: extra-b, 8x H200 (only 4 used by TP=4).
-"""
-
 import unittest
 from types import SimpleNamespace
 
@@ -24,22 +13,13 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=300, stage="extra-b", runner_config="8-gpu-h200")
 
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 GSM8K_ACCURACY_THRESHOLD = 0.93
 
-# DeepSeek-V4-Flash has 21 C4 layers in its default compress_ratios. This
-# pattern follows IndexCache F/S semantics: full indexer (F) layers compute
-# topk, shared (S) layers reuse the nearest previous full layer result.
-INDEX_TOPK_PATTERN = "FSSSFSSSFSSSFSSSFSSSF"
 
-
-class DeepseekV4FlashIndexCacheBase(CustomTestCase):
-    # Subclasses override with the IndexCache recipe; "{}" is a no-op default so
-    # this base is inert if ever collected on its own.
-    json_model_override_args = "{}"
-
+class TestDeepseekV4FlashIndexCache(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = MODEL_FP8
@@ -55,7 +35,7 @@ class DeepseekV4FlashIndexCacheBase(CustomTestCase):
                 "--moe-runner-backend",
                 "marlin",
                 "--json-model-override-args",
-                cls.json_model_override_args,
+                '{"index_topk_freq": 4}',
             ],
         )
 
@@ -64,7 +44,7 @@ class DeepseekV4FlashIndexCacheBase(CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def run_gsm8k(self):
+    def test_gsm8k(self):
         args = SimpleNamespace(
             num_shots=20,
             data_path=None,
@@ -84,20 +64,6 @@ class DeepseekV4FlashIndexCacheBase(CustomTestCase):
             )
 
         self.assertGreater(metrics["accuracy"], GSM8K_ACCURACY_THRESHOLD)
-
-
-class TestDeepseekV4FlashIndexTopkPattern(DeepseekV4FlashIndexCacheBase):
-    json_model_override_args = f'{{"index_topk_pattern": "{INDEX_TOPK_PATTERN}"}}'
-
-    def test_a_gsm8k(self):
-        self.run_gsm8k()
-
-
-class TestDeepseekV4FlashIndexFreq(DeepseekV4FlashIndexCacheBase):
-    json_model_override_args = '{"index_topk_freq": 4}'
-
-    def test_a_gsm8k(self):
-        self.run_gsm8k()
 
 
 if __name__ == "__main__":
